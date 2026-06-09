@@ -42,6 +42,7 @@ class ImageVideoDataset(Dataset):
         self.transform = T.Compose([
             T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
             T.Resize(image_size),
+            T.CenterCrop(image_size),
             T.ToTensor(),
         ])
 
@@ -56,7 +57,7 @@ class ImageVideoDataset(Dataset):
             folder = self.folder_list[index]
             img_list = os.listdir(os.path.join(self.folder, folder))
 
-            img_list = sorted(img_list, key=lambda x: int(x.split('.')[0][4:]))
+            img_list = sorted(img_list, key=lambda x: int(''.join(filter(str.isdigit, x.split('.')[0]))))
             ## pick random frame 
             first_frame_idx = random.randint(0, len(img_list)-1)
             first_frame_idx = min(first_frame_idx, len(img_list)-1)

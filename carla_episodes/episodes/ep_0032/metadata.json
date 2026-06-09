@@ -1,0 +1,10 @@
+{
+  "episode": 32,
+  "map": "Town10HD_Opt",
+  "weather": "Clear",
+  "spawn_x": -27.800329208374023,
+  "spawn_y": -61.2840461730957,
+  "spawn_z": 0.5999999642372131,
+  "spawn_yaw": 0.5967350006103516,
+  "instruction": "Drive on Town10HD_Opt. Weather: Clear. Follow traffic rules."
+}
