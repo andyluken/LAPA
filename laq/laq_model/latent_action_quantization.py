@@ -9,6 +9,8 @@ from einops.layers.torch import Rearrange
 
 from laq_model.attention import Transformer, ContinuousPositionBias
 from laq_model.nsvq import NSVQ
+from laq_model.heatmap_conditioning import apply_patch_heatmap, EgoMotionDirectionEmbedding
+#from laq_model.costmap_loss import costmap_regularization_loss
 
 def exists(val):
     return val is not None
@@ -37,6 +39,12 @@ class LatentActionQuantization(nn.Module):
         attn_dropout = 0.,
         ff_dropout = 0.,
         code_seq_len = 1,
+        heatmap_alpha = 1.0,
+        heatmap_dir_alpha = 0.25,
+        heatmap_abs_dir = False,       # Exp 2: use |fx|+|fy| instead of fx+fy
+        heatmap_additive_dir = False,  # Exp 3: additive direction embedding
+        #costmap_loss_weight = 0.0,
+        #costmap_warmup_steps = 0,
     ):
         """
         einstein notations:
@@ -51,6 +59,12 @@ class LatentActionQuantization(nn.Module):
         super().__init__()
 
         self.code_seq_len = code_seq_len
+        self.heatmap_alpha = heatmap_alpha
+        self.heatmap_dir_alpha = heatmap_dir_alpha
+        self.heatmap_abs_dir = heatmap_abs_dir
+        self.direction_embedding = EgoMotionDirectionEmbedding(dim) if heatmap_additive_dir else None
+        #self.costmap_loss_weight = costmap_loss_weight
+        #self.costmap_warmup_steps = costmap_warmup_steps
         self.image_size = pair(image_size)
         self.patch_size = pair(patch_size)
         patch_height, patch_width = self.patch_size
@@ -125,6 +139,35 @@ class LatentActionQuantization(nn.Module):
         pt = {k.replace('module.', '') if 'module.' in k else k: v for k, v in pt.items()}
         self.load_state_dict(pt)
 
+    '''
+    def _effective_costmap_loss_weight(self, step):
+        """Holds costmap_loss_weight at exactly 0 for costmap_warmup_steps, then
+        switches to the full target weight.
+
+        This is a hard gate, not a gradual ramp -- an earlier linear-ramp
+        version (nonzero from step 1) still collapsed the codebook
+        identically to a constant weight. A controlled isolation test (same
+        forward pass, costmap_regularization_loss's output manually
+        .detach()-ed so it contributes literally zero gradient) recovered
+        cleanly, while every version with ANY live gradient from this term
+        -- regardless of loss formulation, weight magnitude (0.001-0.3), or
+        gradient-clipping settings -- collapsed the codebook permanently.
+        That isolates the cause to the gradient itself interfering with
+        NSVQ's fragile early-training codebook formation specifically,
+        not to overshooting some magnitude threshold. So: exactly zero
+        gradient contribution (this hard gate) until the codebook has
+        stabilized on its own (replace_unused_codebooks logs "Replaced 0"
+        consistently by ~step 700-1000 in every healthy run), then the
+        regularizer is introduced at full strength against an already-
+        diverse, more robust representation. costmap_warmup_steps=0
+        (default) disables the gate entirely -- constant weight from step 0,
+        matching prior behavior.
+        """
+        if step < self.costmap_warmup_steps:
+            return 0.0
+        return self.costmap_loss_weight
+
+    '''
     def decode_from_codebook_indices(self, indices):
         codes = self.vq.codebook[indices]
 
@@ -201,6 +244,8 @@ class LatentActionQuantization(nn.Module):
         video,
         step = 0,
         mask = None,
+        heatmap = None,
+        #costmap = None,
         return_recons_only = False,
         return_only_codebook_ids = False,
     ):
@@ -222,6 +267,14 @@ class LatentActionQuantization(nn.Module):
 
         first_frame_tokens = self.to_patch_emb_first_frame(first_frame)
         rest_frames_tokens = self.to_patch_emb_first_frame(rest_frames)
+
+        if exists(heatmap):
+            first_frame_tokens = apply_patch_heatmap(first_frame_tokens, heatmap[:, :1], self.heatmap_alpha, self.heatmap_dir_alpha, self.heatmap_abs_dir)
+            rest_frames_tokens = apply_patch_heatmap(rest_frames_tokens, heatmap[:, 1:], self.heatmap_alpha, self.heatmap_dir_alpha, self.heatmap_abs_dir)
+            if exists(self.direction_embedding):  # Exp 3: additive direction on top of magnitude gate
+                first_frame_tokens = self.direction_embedding(first_frame_tokens, heatmap[:, :1])
+                rest_frames_tokens = self.direction_embedding(rest_frames_tokens, heatmap[:, 1:])
+
         tokens = torch.cat((first_frame_tokens, rest_frames_tokens), dim = 1)
 
         shape = tokens.shape
@@ -231,7 +284,7 @@ class LatentActionQuantization(nn.Module):
 
         first_tokens, first_packed_fhw_shape = pack([first_tokens], 'b * d')
         last_tokens, last_packed_fhw_shape = pack([last_tokens], 'b * d')
-        
+
 
         vq_mask = None
         if exists(mask):
@@ -239,16 +292,24 @@ class LatentActionQuantization(nn.Module):
         self.lookup_free_quantization = False
         vq_kwargs = dict(mask = vq_mask) if not self.lookup_free_quantization else dict()
 
-        
-        tokens, perplexity, codebook_usage, indices = self.vq(first_tokens, last_tokens, codebook_training_only = False)
-        
-        num_unique_indices = indices.unique().size(0)
-        
+        #effective_costmap_weight = self._effective_costmap_loss_weight(step)
+        #use_costmap_loss = exists(costmap) and effective_costmap_weight > 0
 
+        vq_out = self.vq(first_tokens, last_tokens, codebook_training_only = False)
         
-        if ((step % 10 == 0 and step < 100)  or (step % 100 == 0 and step < 1000) or (step % 500 == 0 and step < 5000)) and step != 0:
-            print(f"update codebook {step}")
-            self.vq.replace_unused_codebooks(tokens.shape[0])
+        tokens, perplexity, codebook_usage, indices= vq_out
+       
+
+        num_unique_indices = indices.unique().size(0)
+
+        if step > 500: # changed from step != 0 to step > 500 for more challenge
+            if step % 10 == 0 and step < 100:
+                self.vq.replace_unused_codebooks(10)
+            elif step % 100 == 0 and step < 1000:
+                self.vq.replace_unused_codebooks(100)
+            elif step % 500 == 0 and step < 5000:
+                self.vq.replace_unused_codebooks(500)
+        
 
         if return_only_codebook_ids:
             return indices
@@ -282,7 +343,19 @@ class LatentActionQuantization(nn.Module):
         else:
             recon_loss = F.mse_loss(video, recon_video)
 
-        return recon_loss, num_unique_indices
+        #if use_costmap_loss:
+        #    costmap_agg = costmap.amax(dim = 1)  # (b, 2, h, w) -> (b, h, w); risk from either frame counts
+        #    costmap_loss = costmap_regularization_loss(continuous_latent, costmap_agg)
+        #else:
+        #    costmap_loss = recon_loss.new_zeros(())
+
+        #loss = recon_loss + effective_costmap_weight * costmap_loss
+        loss = recon_loss
+
+        #aux_logs = {'recon_loss': recon_loss.item(), 'costmap_loss': costmap_loss.item()}
+        aux_logs = {'recon_loss': recon_loss.item()}
+
+        return loss, num_unique_indices, aux_logs
         
 
     def inference(
@@ -290,10 +363,11 @@ class LatentActionQuantization(nn.Module):
         video,
         step = 0,
         mask = None,
+        heatmap = None,
         return_only_codebook_ids=False,
         user_action_token_num=None
     ):
-        
+
         assert video.ndim in {4, 5}
 
         is_image = video.ndim == 4
@@ -311,6 +385,14 @@ class LatentActionQuantization(nn.Module):
 
         first_frame_tokens = self.to_patch_emb_first_frame(first_frame)
         rest_frames_tokens = self.to_patch_emb_first_frame(rest_frames)
+
+        if exists(heatmap):
+            first_frame_tokens = apply_patch_heatmap(first_frame_tokens, heatmap[:, :1], self.heatmap_alpha, self.heatmap_dir_alpha, self.heatmap_abs_dir)
+            rest_frames_tokens = apply_patch_heatmap(rest_frames_tokens, heatmap[:, 1:], self.heatmap_alpha, self.heatmap_dir_alpha, self.heatmap_abs_dir)
+            if exists(self.direction_embedding):  # Exp 3: additive direction on top of magnitude gate
+                first_frame_tokens = self.direction_embedding(first_frame_tokens, heatmap[:, :1])
+                rest_frames_tokens = self.direction_embedding(rest_frames_tokens, heatmap[:, 1:])
+
         tokens = torch.cat((first_frame_tokens, rest_frames_tokens), dim = 1)
 
 

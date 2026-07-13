@@ -25,6 +25,13 @@ setup(
     'opencv-python',
     'pillow',
     'numpy',
+    'ultralytics',
+    # nuscenes-devkit==1.2.0 (the only PyPI release) declares numpy<2.0 and
+    # Shapely~=2.0.3 pins that are stale, not load-bearing: it runs correctly
+    # against this project's numpy 2.x / Shapely 2.x. pip will print a
+    # resolver warning on install; no downgrade is needed or performed.
+    'nuscenes-devkit',
+    'pyquaternion',
     "torch==2.2.0",
     "torchvision>=0.16.0",
     "torchaudio",

@@ -13,17 +13,13 @@ Outputs:
 import os
 os.environ["WANDB_MODE"] = "offline"
 
-import json
 import sys
 from pathlib import Path
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from torchvision import transforms as T
-from scipy.spatial.transform import Rotation
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,102 +28,25 @@ torch.backends.cudnn.enabled = False
 
 sys.path.insert(0, str(Path(__file__).parent))
 from laq_model import LatentActionQuantization
+from laq_model.eval_utils import IMAGE_TRANSFORM, MANEUVERS, load_nuscenes_pairs, maneuver_label
 
 # ── Config ────────────────────────────────────────────────────────────────────
 NUSCENES_ROOT   = Path("/home/andy/Dataset/Nuscenes/v1.0-mini")
-ANNOT_DIR       = NUSCENES_ROOT / "v1.0-mini"
-CHECKPOINT      = Path(__file__).parent / "results_nuscenes_smoke_v3/vae.2000.pt"
+CHECKPOINT      = Path("results_nuscenes_egomotion_smoke/vae.3000.pt")
 OFFSET          = 3        # must match training
 BATCH_SIZE      = 8
 CAMERA          = "CAM_FRONT"
 
-# Maneuver thresholds for OFFSET=3 frames at ~12 Hz (≈250ms between pair)
-YAW_THRESH      = 0.06     # rad (~3.4°): |yaw_delta| above this → turning
-DIST_THRESH     = 0.2      # m: distance below this → stationary
-MANEUVERS       = ["straight", "turn_left", "turn_right", "stationary"]
-
-
-# ── Preprocessing (matches data.py training fix) ──────────────────────────────
-transform = T.Compose([
-    T.Lambda(lambda img: img.convert("RGB")),
-    T.Resize(256),
-    T.CenterCrop(256),
-    T.ToTensor(),
-])
-
-
-def yaw_delta(pose_t, pose_t3):
-    """Signed yaw change (radians) from pose_t to pose_t3.
-    nuScenes quaternion = [w, x, y, z]; scipy expects [x, y, z, w].
-    """
-    def to_rot(p):
-        q = p["rotation"]           # [w, x, y, z]
-        return Rotation.from_quat([q[1], q[2], q[3], q[0]])
-
-    rel = to_rot(pose_t3) * to_rot(pose_t).inv()
-    return float(rel.as_rotvec()[2])  # z-component ≈ yaw for flat road
-
-
-def maneuver_label(pose_t, pose_t3):
-    t, t3 = pose_t["translation"], pose_t3["translation"]
-    dist = ((t3[0] - t[0]) ** 2 + (t3[1] - t[1]) ** 2) ** 0.5
-    if dist < DIST_THRESH:
-        return "stationary"
-    yaw = yaw_delta(pose_t, pose_t3)
-    if yaw > YAW_THRESH:
-        return "turn_left"
-    if yaw < -YAW_THRESH:
-        return "turn_right"
-    return "straight"
-
-
-def load_nuscenes_pairs():
-    """Build list of (img_path_t, img_path_t3, ego_pose_t, ego_pose_t3)."""
-    with open(ANNOT_DIR / "sensor.json") as f:
-        sensors = json.load(f)
-    cam_token = next(s["token"] for s in sensors if s["channel"] == CAMERA)
-
-    with open(ANNOT_DIR / "calibrated_sensor.json") as f:
-        cal_sensors = json.load(f)
-    cal_tokens = {cs["token"] for cs in cal_sensors if cs["sensor_token"] == cam_token}
-
-    with open(ANNOT_DIR / "sample_data.json") as f:
-        sample_data = json.load(f)
-    cam_frames = [sd for sd in sample_data if sd["calibrated_sensor_token"] in cal_tokens]
-
-    with open(ANNOT_DIR / "ego_pose.json") as f:
-        ego_poses = json.load(f)
-    ego_by_token = {ep["token"]: ep for ep in ego_poses}
-
-    by_token = {sd["token"]: sd for sd in cam_frames}
-    roots = [sd for sd in cam_frames if not sd["prev"]]
-
-    pairs = []
-    for root in roots:
-        chain = []
-        curr = root
-        while curr:
-            chain.append(curr)
-            curr = by_token.get(curr["next"]) if curr["next"] else None
-        for i in range(len(chain) - OFFSET):
-            f_t  = chain[i]
-            f_t3 = chain[i + OFFSET]
-            pairs.append((
-                NUSCENES_ROOT / f_t["filename"],
-                NUSCENES_ROOT / f_t3["filename"],
-                ego_by_token[f_t["ego_pose_token"]],
-                ego_by_token[f_t3["ego_pose_token"]],
-            ))
-    return pairs
+transform = IMAGE_TRANSFORM
 
 
 def load_model():
     assert CHECKPOINT.exists(), f"Checkpoint not found: {CHECKPOINT}\nRun training first."
     laq = LatentActionQuantization(
-        dim=256, quant_dim=32, codebook_size=4,
+        dim=512, quant_dim=32, codebook_size=4,
         image_size=256, patch_size=32,
         spatial_depth=2, temporal_depth=2,
-        dim_head=64, heads=4, code_seq_len=1,
+        dim_head=64, heads=16, code_seq_len=1,
     ).cuda().eval()
     laq.load_state_dict(torch.load(str(CHECKPOINT), map_location="cuda"))
     print(f"Loaded checkpoint: {CHECKPOINT}")
@@ -193,14 +112,14 @@ def plot_and_print(results, n_codes=4):
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
-    out = Path(__file__).parent / "latent_cluster_results.png"
+    out = Path(__file__).parent / "latent_cluster_results_egomotion.png"
     plt.savefig(out, dpi=150)
     print(f"Chart saved → {out}")
 
 
 if __name__ == "__main__":
     print("Loading nuScenes frame pairs...")
-    pairs = load_nuscenes_pairs()
+    pairs = load_nuscenes_pairs(NUSCENES_ROOT, OFFSET, camera=CAMERA)
     print(f"  {len(pairs)} pairs across {OFFSET}-frame offset")
 
     laq = load_model()

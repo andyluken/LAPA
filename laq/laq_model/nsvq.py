@@ -109,7 +109,7 @@ class NSVQ(torch.nn.Module):
         quantized_input = self.project_out(quantized_input)
         return quantized_input
     
-    def forward(self, input_data_first, input_data_last, codebook_training_only=False):
+    def forward(self, input_data_first, input_data_last, codebook_training_only=False, return_continuous=False):
 
         """
         This function performs the main proposed vector quantization function using NSVQ trick to pass the gradients.
@@ -123,6 +123,14 @@ class NSVQ(torch.nn.Module):
         outputs:
                 quantized_input (vector quantized version of input data used for training | shape: (NxD) )
                 perplexity (average usage of codebook entries)
+
+        If return_continuous=True, also returns the pre-quantization continuous
+        delta vector (input_data_last - input_data_first), reshaped to one row
+        per batch sample (shape: (batch_size, code_seq_len * embedding_dim)).
+        This is the "raw" latent-action representation used by
+        laq_model/costmap_loss.py to regularize latent proximity by cost-map
+        similarity, before discretization. Default False preserves the exact
+        original 4-tuple return signature.
         """
 
         batch_size = input_data_first.shape[0]
@@ -171,7 +179,14 @@ class NSVQ(torch.nn.Module):
         # Also notice you do not need to add a new loss term (for VQ) to your global loss function to optimize codebooks.
         # Just return the tensor of "quantized_input" as vector quantized version of the input data.
         
+        if return_continuous:
+            continuous = input_data.reshape(batch_size, -1)
+
         quantized_input = self.decode(quantized_input, batch_size)
+
+        if return_continuous:
+            return quantized_input, perplexity, self.codebooks_used.cpu().numpy(), min_indices.reshape(batch_size, -1), continuous
+
         return quantized_input, perplexity, self.codebooks_used.cpu().numpy(), min_indices.reshape(batch_size, -1)
 
     def replace_unused_codebooks(self, num_batches):

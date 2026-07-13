@@ -7,3 +7,14 @@ results_nuscenes_smoke/
 results_nuscenes_smoke_v2/
 results_nuscenes_smoke_v3/
 results_nuscenes_stage2_debug/
+
+# LAQ-AD experiment results (model checkpoints, large binaries)
+results_laq_ad*/
+laq_ad/results_*/
+*.pt
+*.pth
+*.egg-info/
+
+# Large generated/downloaded files
+optical_flow/
+yolo11n.pt

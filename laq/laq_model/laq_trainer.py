@@ -18,16 +18,20 @@ from laq_model.optimizer import get_optimizer
 from ema_pytorch import EMA
 
 
-from laq_model.data import ImageVideoDataset
+from laq_model.data import ImageVideoDataset as _DefaultImageVideoDataset
 
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.state import DistributedType
 
 from einops import rearrange
 
 
 def exists(val):
     return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
 
 def noop(*args, **kwargs):
     pass
@@ -72,6 +76,9 @@ class LAQTrainer(nn.Module):
         accelerate_kwargs: dict = dict(),
         weights = None,
         offsets = None,
+        dataset_cls = None,
+        dataset_returns_heatmap = False,
+        #dataset_returns_costmap = False,
     ):
         super().__init__()
         image_size = vae.image_size
@@ -113,10 +120,12 @@ class LAQTrainer(nn.Module):
 
         # create dataset
         self.train_on_images = train_on_images
-        
-        
-        # sthv2 training
-        self.ds = ImageVideoDataset(folder, image_size, offset=offsets)
+        self.dataset_returns_heatmap = dataset_returns_heatmap
+        #self.dataset_returns_costmap = dataset_returns_costmap
+
+        # sthv2 training (or any dataset_cls override, e.g. HeatmapVideoDataset)
+        dataset_cls = default(dataset_cls, _DefaultImageVideoDataset)
+        self.ds = dataset_cls(folder, image_size, offset=offsets)
 
         self.valid_ds = self.ds
 
@@ -225,6 +234,23 @@ class LAQTrainer(nn.Module):
     def is_local_main(self):
         return self.accelerator.is_local_main_process
 
+    def _unpack_batch(self, batch, device):
+        """Splits a dataloader batch into (video, heatmap_or_None, costmap_or_None), moved to `device`.
+
+        dataset_returns_heatmap / dataset_returns_costmap toggle whether the
+        dataloader yields a plain video tensor (default, e.g.
+        ImageVideoDataset), a (video, heatmap) tuple (HeatmapVideoDataset),
+        or a (video, heatmap, costmap) tuple (CostmapVideoDataset) — see
+        laq_model/data.py.
+        """
+        #if self.dataset_returns_costmap:
+        #    video, heatmap, costmap = batch
+        #    return video.to(device), heatmap.to(device), costmap.to(device)
+        if self.dataset_returns_heatmap:
+            video, heatmap = batch
+            return video.to(device), heatmap.to(device), None
+        return batch.to(device), None, None
+
     def train_step(self):
         device = self.device
 
@@ -239,19 +265,21 @@ class LAQTrainer(nn.Module):
         # update vae (generator)
 
         for _ in range(self.grad_accum_every):
-            img = next(self.dl_iter)
-            img = img.to(device)
+            img, heatmap, costmap = self._unpack_batch(next(self.dl_iter), device)
 
             # with self.accelerator.autocast():
-            loss, num_unique_indices = self.vae(
+            loss, num_unique_indices, aux_logs = self.vae(
                 img,
                 step=steps,
+                heatmap=heatmap,
+                #costmap=costmap,
             )
 
             self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
             accum_log(logs, {'num_unique_indices': num_unique_indices})
+            accum_log(logs, {k: v / self.grad_accum_every for k, v in aux_logs.items()})
 
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.vae.parameters(), self.max_grad_norm)
@@ -275,12 +303,9 @@ class LAQTrainer(nn.Module):
             for model, filename in vaes_to_evaluate:
                 model.eval()
 
-                valid_data = next(self.valid_dl_iter)
+                valid_data, valid_heatmap, _ = self._unpack_batch(next(self.valid_dl_iter), device)
 
-
-                valid_data = valid_data.to(device)
-
-                recons = model(valid_data, return_recons_only = True)
+                recons = model(valid_data, heatmap=valid_heatmap, return_recons_only = True)
 
 
                 if self.train_on_images:

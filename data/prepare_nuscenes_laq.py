@@ -1,67 +1,89 @@
-"""
-Prepares nuScenes mini dataset for LAQ training.
+"""Prepares nuScenes dataset for LAQ-AD training.
 
-Creates a folder structure compatible with ImageVideoDataset:
+Exports only KEYFRAME images (annotated samples at ~2 Hz, not 12 Hz sweeps).
+This matches NuScenesLAQDataset._build_index which iterates sample tokens and
+maps sample_index_i → frame_{i+1:04d}.jpg within each scene directory.
+
+Directory structure:
   OUTPUT_DIR/
-    scene_000/
-      frame0001.jpg -> .../sweeps/CAM_FRONT/xxx.jpg  (symlink)
-      frame0002.jpg -> ...
-    scene_001/
+    <scene_token>/
+      frame_0001.jpg → .../samples/CAM_FRONT/<keyframe>.jpg  (symlink)
+      frame_0002.jpg → ...
       ...
 
 Uses symlinks so no data is copied. Run once before training.
+
+Usage:
+    # mini (default)
+    python data/prepare_nuscenes_laq.py
+
+    # trainval
+    python data/prepare_nuscenes_laq.py \\
+        --dataroot /media/andy/Samsung_T7/nuScenes/Trainval \\
+        --version v1.0-trainval \\
+        --output /home/andy/Dataset/nuscenes_laq_frames
 """
 
-import json
+import argparse
 import os
 from pathlib import Path
 
-NUSCENES_ROOT = Path("/home/andy/Dataset/Nuscenes/v1.0-mini")
-ANNOT_DIR = NUSCENES_ROOT / "v1.0-mini"
-OUTPUT_DIR = Path("/tmp/nuscenes_laq_frames")
-CAMERA = "CAM_FRONT"
+DEFAULT_DATAROOT = Path("/home/andy/Dataset/Nuscenes/v1.0-mini")
+DEFAULT_VERSION = "v1.0-mini"
+DEFAULT_OUTPUT = Path("/home/andy/Dataset/nuscenes_laq_frames_improved")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dataroot", type=Path, default=DEFAULT_DATAROOT,
+                   help="nuScenes dataset root (contains the version subdir)")
+    p.add_argument("--version", default=DEFAULT_VERSION,
+                   help="nuScenes version string, e.g. v1.0-mini or v1.0-trainval")
+    p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
+                   help="Output directory for frame symlinks")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Recreate symlinks even if destination already exists")
+    return p.parse_args()
 
 
 def main():
-    with open(ANNOT_DIR / "sensor.json") as f:
-        sensors = json.load(f)
-    cam_token = next(s["token"] for s in sensors if s["channel"] == CAMERA)
+    args = parse_args()
 
-    with open(ANNOT_DIR / "calibrated_sensor.json") as f:
-        cal_sensors = json.load(f)
-    cal_tokens = {cs["token"] for cs in cal_sensors if cs["sensor_token"] == cam_token}
+    # Use nuScenes API to iterate scenes and samples correctly
+    from nuscenes.nuscenes import NuScenes
+    nusc = NuScenes(version=args.version, dataroot=str(args.dataroot), verbose=False)
 
-    with open(ANNOT_DIR / "sample_data.json") as f:
-        sample_data = json.load(f)
-    cam_frames = [sd for sd in sample_data if sd["calibrated_sensor_token"] in cal_tokens]
+    print(f"nuScenes root : {args.dataroot}")
+    print(f"Version       : {args.version}  ({len(nusc.scene)} scenes, {len(nusc.sample)} keyframes)")
+    print(f"Output        : {args.output}")
 
-    by_token = {sd["token"]: sd for sd in cam_frames}
-    # roots = first frame in each scene's CAM_FRONT stream (no predecessor)
-    roots = [sd for sd in cam_frames if not sd["prev"]]
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    args.output.mkdir(parents=True, exist_ok=True)
 
     total_frames = 0
-    for i, root in enumerate(roots):
-        scene_dir = OUTPUT_DIR / f"scene_{i:03d}"
+    for scene in nusc.scene:
+        scene_dir = args.output / scene["token"]
         scene_dir.mkdir(exist_ok=True)
 
-        n = 1
-        curr = root
-        while curr:
-            dst = scene_dir / f"frame{n:04d}.jpg"
+        # Walk the sample (keyframe) chain for this scene
+        sample = nusc.get("sample", scene["first_sample_token"])
+        i = 1
+        while True:
+            cam_data = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
+            dst = scene_dir / f"frame_{i:04d}.jpg"
+            if args.overwrite and dst.exists():
+                dst.unlink()
             if not dst.exists():
-                os.symlink(NUSCENES_ROOT / curr["filename"], dst)
-            n += 1
-            curr = by_token.get(curr["next"]) if curr["next"] else None
+                os.symlink(Path(args.dataroot) / cam_data["filename"], dst)
+            i += 1
+            if sample["next"] == "":
+                break
+            sample = nusc.get("sample", sample["next"])
 
-        frames_in_scene = n - 1
+        frames_in_scene = i - 1
         total_frames += frames_in_scene
-        print(f"  scene_{i:03d}: {frames_in_scene} frames")
 
-    print(f"\n{len(roots)} scenes, {total_frames} total frames, "
-          f"~{total_frames - len(roots)} consecutive pairs available")
-    print(f"Output: {OUTPUT_DIR}")
+    print(f"\n{len(nusc.scene)} scenes, {total_frames} keyframes exported")
+    print(f"Output: {args.output}")
 
 
 if __name__ == "__main__":
